@@ -1,65 +1,41 @@
-# Discord AI Ticket Bot (Powered by Grok)
+# Discord AI Ticket + Applications + AutoMod Bot
 
-A simple Discord bot that lets users open private support tickets and automatically answers them using Grok AI from xAI.
-
-## Features
-
-- Button panel to create private tickets
-- AI-powered replies in ticket channels using Grok
-- Close ticket button
-- Staff role support
-- Persistent create button
+A feature-rich Discord bot with:
+- Ticket system with button panel
+- Application system (up to 15) with buttons or dropdowns and role rewards
+- AutoMod commands (ban, kick, timeout)
+- Logging (joins, leaves, message deletes, automod actions)
+- Invite tracking
+- Custom embed creator
+- Nickname lock on join (sets nickname to username)
 
 ## Setup
 
-### 1. Create a Discord Application
+1. Create a Discord bot at https://discord.com/developers/applications
+   - Enable **Message Content**, **Server Members**, and **Presence** intents
+2. Get an optional xAI API key from https://console.x.ai (for AI ticket replies)
+3. Copy `.env.example` to `.env` and fill in your token
+4. Install:
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. Run: `python bot.py`
 
-1. Go to https://discord.com/developers/applications
-2. Create a new application → Bot → Reset Token (copy it)
-3. Enable **Message Content Intent** and **Server Members Intent** under Privileged Gateway Intents
-4. Invite the bot with these permissions:
-   - Manage Channels
-   - Send Messages
-   - Read Message History
-   - Manage Messages
-   - View Channels
-   - Use Slash Commands
+## Commands (slash)
 
-### 2. Get an xAI API Key
-
-1. Go to https://console.x.ai
-2. Create an API key
-3. Copy it
-
-### 3. Configure the Bot
-
-1. Copy `.env.example` to `.env`
-2. Fill in:
-   - `DISCORD_TOKEN`
-   - `XAI_API_KEY`
-   - `TICKET_CATEGORY_ID` — Create a category called "Tickets" in your server, right-click → Copy ID (Developer Mode must be on)
-   - `SUPPORT_ROLE_ID` (optional) — Role that can see tickets
-
-### 4. Install & Run
-
-```bash
-python -m venv venv
-source venv/bin/activate   # or venv\Scripts\activate on Windows
-pip install -r requirements.txt
-python bot.py
-```
-
-### 5. In Discord
-
-1. Run `/setup` (as admin) in the channel where you want the ticket panel
-2. Users click **Create Ticket**
-3. The AI will automatically reply to messages in the ticket
+- `/setup` — Set log channel and ticket category
+- `/ticketpanel` — Send ticket button panel
+- `/createapplication` — Create an application (name, role, optional questions separated by `||`)
+- `/applicationpanel` — Send applications panel
+- `/embed` — Create a custom embed
+- `/ban` `/kick` `/timeout` — Moderation
+- `/invites` — Check invite count
 
 ## Notes
 
-- The bot only replies in channels whose names start with `ticket-`
-- Close buttons on existing tickets may need the bot to be online when created for full persistence after restarts (simple version)
-- Change the model in `bot.py` if needed (`grok-4`, `grok-3`, etc.)
-- Keep your `.env` file private!
+- Invite tracking is approximate (based on invite use increases).
+- Application questions are stored but the full multi-step form can be expanded.
+- Nickname locking works best if nickname changes are disabled in server settings.
+- Database is stored in `bot.db` (created automatically).
 
-Enjoy your AI-powered support bot!
+Keep your `.env` private!

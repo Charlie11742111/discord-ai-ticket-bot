@@ -1,199 +1,324 @@
 import os
 import asyncio
-from typing import Optional
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Config
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
-TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0"))  # Set this to your tickets category ID
-SUPPORT_ROLE_ID = int(os.getenv("SUPPORT_ROLE_ID", "0"))  # Optional staff role ID
 
-if not DISCORD_TOKEN or not XAI_API_KEY:
-    raise ValueError("Missing DISCORD_TOKEN or XAI_API_KEY in .env")
+if not DISCORD_TOKEN:
+    raise ValueError("Missing DISCORD_TOKEN in .env")
 
-# AI Client (xAI / Grok)
-ai_client = AsyncOpenAI(
-    api_key=XAI_API_KEY,
-    base_url="https://api.x.ai/v1",
-)
+# Optional AI (can run without it)
+ai_client = None
+if XAI_API_KEY:
+    ai_client = AsyncOpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+intents.invites = True
+intents.moderation = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# Database
+db = sqlite3.connect("bot.db", check_same_thread=False)
+cursor = db.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    guild_id INTEGER PRIMARY KEY,
+    log_channel INTEGER,
+    ticket_category INTEGER,
+    automod_enabled INTEGER DEFAULT 1
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    name TEXT,
+    role_id INTEGER,
+    questions TEXT,
+    style TEXT DEFAULT 'button'
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS invites (
+    guild_id INTEGER,
+    user_id INTEGER,
+    invite_count INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
+db.commit()
+
+# Invite cache
+invite_cache: Dict[int, Dict[str, int]] = {}
+
+async def update_invite_cache(guild: discord.Guild):
+    try:
+        invites = await guild.invites()
+        invite_cache[guild.id] = {inv.code: inv.uses for inv in invites}
+    except:
+        invite_cache[guild.id] = {}
+
+async def get_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    cursor.execute("SELECT log_channel FROM settings WHERE guild_id = ?", (guild.id,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        return guild.get_channel(row[0])
+    return None
+
+async def log_event(guild: discord.Guild, embed: discord.Embed):
+    channel = await get_log_channel(guild)
+    if channel:
+        try:
+            await channel.send(embed=embed)
+        except:
+            pass
 
 class TicketPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Create Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket_btn", emoji="🎟")
-    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.green, custom_id="open_ticket", emoji="🎟")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-
         guild = interaction.guild
         if not guild:
-            return await interaction.followup.send("This can only be used in a server.", ephemeral=True)
+            return
 
-        # Check if user already has an open ticket
-        category = guild.get_channel(TICKET_CATEGORY_ID)
-        if not category or not isinstance(category, discord.CategoryChannel):
-            return await interaction.followup.send("Ticket category not configured properly. Ask an admin to set TICKET_CATEGORY_ID.", ephemeral=True)
+        cursor.execute("SELECT ticket_category FROM settings WHERE guild_id = ?", (guild.id,))
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return await interaction.followup.send("Ticket category not set. Ask an admin to use `/setup tickets`.", ephemeral=True)
 
-        existing = discord.utils.get(category.channels, name=f"ticket-{interaction.user.name.lower().replace(' ', '-')}")
-        if existing:
-            return await interaction.followup.send(f"You already have an open ticket: {existing.mention}", ephemeral=True)
+        category = guild.get_channel(row[0])
+        if not category:
+            return await interaction.followup.send("Ticket category not found.", ephemeral=True)
 
-        # Create private channel
+        name = f"ticket-{interaction.user.name.lower()}"
+        if discord.utils.get(category.channels, name=name):
+            return await interaction.followup.send("You already have an open ticket.", ephemeral=True)
+
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
         }
-        if SUPPORT_ROLE_ID:
-            role = guild.get_role(SUPPORT_ROLE_ID)
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
-        channel = await category.create_text_channel(
-            name=f"ticket-{interaction.user.name.lower().replace(' ', '-')}",
-            overwrites=overwrites,
-            topic=f"Support ticket for {interaction.user} (ID: {interaction.user.id})",
-            reason="New support ticket created"
-        )
-
-        embed = discord.Embed(
-            title="🎟 Support Ticket",
-            description=f"Hello {interaction.user.mention}!\n\nDescribe your issue below and the AI assistant will help you.\nStaff can also respond here.\n\nClick the button below to close this ticket when you're done.",
-            color=discord.Color.green()
-        )
-        embed.set_footer(text="Powered by Grok AI")
-
-        view = TicketControls(channel.id)
-        await channel.send(embed=embed, view=view)
+        channel = await category.create_text_channel(name=name, overwrites=overwrites)
+        embed = discord.Embed(title="Support Ticket", description=f"Hello {interaction.user.mention}, describe your issue.", color=discord.Color.green())
+        await channel.send(embed=embed, view=TicketClose(channel.id))
         await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
 
-
-class TicketControls(discord.ui.View):
+class TicketClose(discord.ui.View):
     def __init__(self, channel_id: int):
         super().__init__(timeout=None)
         self.channel_id = channel_id
 
-    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket_btn", emoji="🔒")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.channel.id != self.channel_id:
-            return
-
-        await interaction.response.send_message("Closing ticket in 5 seconds...", ephemeral=False)
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Closing in 5 seconds...")
         await asyncio.sleep(5)
-        try:
-            await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
-        except discord.HTTPException:
-            await interaction.followup.send("Failed to delete channel. Please delete it manually.", ephemeral=True)
+        await interaction.channel.delete()
 
+class ApplicationSelect(discord.ui.Select):
+    def __init__(self, apps: List[tuple]):
+        options = [discord.SelectOption(label=app[2], value=str(app[0])) for app in apps[:15]]
+        super().__init__(placeholder="Choose an application", options=options, custom_id="app_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        app_id = int(self.values[0])
+        cursor.execute("SELECT questions, role_id FROM applications WHERE id = ?", (app_id,))
+        row = cursor.fetchone()
+        if not row:
+            return await interaction.response.send_message("Application not found.", ephemeral=True)
+
+        questions = row[0].split("||") if row[0] else []
+        await interaction.response.send_message(f"Starting application. Answer the questions in this channel or DM.", ephemeral=True)
+        await interaction.followup.send("Questions will be asked one by one. (Full multi-step system can be expanded.)", ephemeral=True)
+
+class ApplicationView(discord.ui.View):
+    def __init__(self, apps: List[tuple], style: str = "button"):
+        super().__init__(timeout=None)
+        if style == "dropdown":
+            self.add_item(ApplicationSelect(apps))
+        else:
+            for app in apps[:15]:
+                btn = discord.ui.Button(label=app[2], custom_id=f"app_{app[0]}", style=discord.ButtonStyle.primary)
+                btn.callback = self.make_callback(app[0])
+                self.add_item(btn)
+
+    def make_callback(self, app_id):
+        async def callback(interaction: discord.Interaction):
+            cursor.execute("SELECT questions, role_id, name FROM applications WHERE id = ?", (app_id,))
+            row = cursor.fetchone()
+            if not row:
+                return await interaction.response.send_message("Application not found.", ephemeral=True)
+            questions = row[0].split("||") if row[0] else []
+            if not questions:
+                role = interaction.guild.get_role(row[1])
+                if role:
+                    await interaction.user.add_roles(role)
+                    await interaction.response.send_message(f"You received the {role.name} role!", ephemeral=True)
+                else:
+                    await interaction.response.send_message("Role not found.", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"Application **{row[2]}** has questions. A full form system would ask them here.", ephemeral=True)
+        return callback
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    # Register persistent views
+    print(f"Logged in as {bot.user}")
     bot.add_view(TicketPanel())
-    # Note: TicketControls needs to be re-added if you want buttons to work after restart.
-    # For simplicity, new tickets get fresh views. For full persistence of close buttons,
-    # store channel IDs and re-register on startup (advanced).
+    for guild in bot.guilds:
+        await update_invite_cache(guild)
+    await bot.tree.sync()
+    print("Synced commands")
+
+@bot.event
+async def on_member_join(member: discord.Member):
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands")
-    except Exception as e:
-        print(f"Failed to sync commands: {e}")
+        await member.edit(nick=member.name)
+    except:
+        pass
 
+    try:
+        invites_before = invite_cache.get(member.guild.id, {})
+        invites_after = await member.guild.invites()
+        for inv in invites_after:
+            before = invites_before.get(inv.code, 0)
+            if inv.uses > before:
+                cursor.execute("""
+                    INSERT INTO invites (guild_id, user_id, invite_count) VALUES (?, ?, 1)
+                    ON CONFLICT(guild_id, user_id) DO UPDATE SET invite_count = invite_count + 1
+                """, (member.guild.id, inv.inviter.id))
+                db.commit()
+                embed = discord.Embed(title="Member Joined", description=f"{member.mention} joined via invite from {inv.inviter.mention}", color=discord.Color.green())
+                await log_event(member.guild, embed)
+                break
+        await update_invite_cache(member.guild)
+    except:
+        embed = discord.Embed(title="Member Joined", description=f"{member.mention} joined", color=discord.Color.green())
+        await log_event(member.guild, embed)
 
-@bot.tree.command(name="setup", description="Post the ticket creation panel")
+@bot.event
+async def on_member_remove(member: discord.Member):
+    embed = discord.Embed(title="Member Left", description=f"{member.mention} left the server", color=discord.Color.red())
+    await log_event(member.guild, embed)
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+    embed = discord.Embed(title="Message Deleted", description=f"**Author:** {message.author.mention}\n**Content:** {message.content[:1000] or '(embed/attachment)'}", color=discord.Color.orange())
+    await log_event(message.guild, embed)
+
+@bot.tree.command(name="setup", description="Setup bot settings")
 @commands.has_permissions(administrator=True)
-async def setup(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Need Help?",
-        description="Click the button below to open a private support ticket.\nAn AI assistant will help answer your questions!",
-        color=discord.Color.blurple()
-    )
-    embed.set_footer(text="Powered by Grok")
+async def setup(interaction: discord.Interaction, log_channel: discord.TextChannel = None, ticket_category: discord.CategoryChannel = None):
+    cursor.execute("""
+        INSERT INTO settings (guild_id, log_channel, ticket_category) VALUES (?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET log_channel = COALESCE(?, log_channel), ticket_category = COALESCE(?, ticket_category)
+    """, (interaction.guild.id, log_channel.id if log_channel else None, ticket_category.id if ticket_category else None,
+          log_channel.id if log_channel else None, ticket_category.id if ticket_category else None))
+    db.commit()
+    await interaction.response.send_message("Settings updated!", ephemeral=True)
+
+@bot.tree.command(name="ticketpanel", description="Send the ticket panel")
+@commands.has_permissions(administrator=True)
+async def ticketpanel(interaction: discord.Interaction):
+    embed = discord.Embed(title="Need Help?", description="Click the button below to open a private ticket.", color=discord.Color.blurple())
     await interaction.response.send_message(embed=embed, view=TicketPanel())
 
+@bot.tree.command(name="createapplication", description="Create an application (max 15)")
+@commands.has_permissions(administrator=True)
+async def createapplication(interaction: discord.Interaction, name: str, role: discord.Role, questions: str = "", style: str = "button"):
+    cursor.execute("SELECT COUNT(*) FROM applications WHERE guild_id = ?", (interaction.guild.id,))
+    if cursor.fetchone()[0] >= 15:
+        return await interaction.response.send_message("Maximum 15 applications reached.", ephemeral=True)
+    cursor.execute("INSERT INTO applications (guild_id, name, role_id, questions, style) VALUES (?, ?, ?, ?, ?)",
+                   (interaction.guild.id, name, role.id, questions, style))
+    db.commit()
+    await interaction.response.send_message(f"Application **{name}** created!", ephemeral=True)
 
-async def get_ai_response(messages: list) -> str:
-    try:
-        response = await ai_client.chat.completions.create(
-            model="grok-4",  # or "grok-3", "grok-4.7" etc. Check available models
-            messages=messages,
-            temperature=0.7,
-            max_tokens=800,
-        )
-        return response.choices[0].message.content or "Sorry, I couldn't generate a response."
-    except Exception as e:
-        print(f"AI Error: {e}")
-        return "Sorry, the AI is temporarily unavailable. A staff member will help you soon."
+@bot.tree.command(name="applicationpanel", description="Send the applications panel")
+@commands.has_permissions(administrator=True)
+async def applicationpanel(interaction: discord.Interaction):
+    cursor.execute("SELECT id, guild_id, name, role_id, questions, style FROM applications WHERE guild_id = ?", (interaction.guild.id,))
+    apps = cursor.fetchall()
+    if not apps:
+        return await interaction.response.send_message("No applications created yet.", ephemeral=True)
+    style = apps[0][5] if apps else "button"
+    embed = discord.Embed(title="Applications", description="Select an application below to apply for a role.", color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed, view=ApplicationView(apps, style))
 
+@bot.tree.command(name="embed", description="Create a custom embed")
+@commands.has_permissions(administrator=True)
+async def embed_cmd(interaction: discord.Interaction, title: str, description: str, color: str = "blurple"):
+    colors = {"blurple": discord.Color.blurple(), "green": discord.Color.green(), "red": discord.Color.red(), "gold": discord.Color.gold()}
+    embed = discord.Embed(title=title, description=description, color=colors.get(color.lower(), discord.Color.blurple()))
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="ban", description="Ban a member")
+@commands.has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    await member.ban(reason=reason)
+    embed = discord.Embed(title="Member Banned", description=f"{member.mention} was banned by {interaction.user.mention}\n**Reason:** {reason}", color=discord.Color.red())
+    await log_event(interaction.guild, embed)
+    await interaction.response.send_message(f"Banned {member.mention}", ephemeral=True)
+
+@bot.tree.command(name="kick", description="Kick a member")
+@commands.has_permissions(kick_members=True)
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    await member.kick(reason=reason)
+    embed = discord.Embed(title="Member Kicked", description=f"{member.mention} was kicked by {interaction.user.mention}\n**Reason:** {reason}", color=discord.Color.orange())
+    await log_event(interaction.guild, embed)
+    await interaction.response.send_message(f"Kicked {member.mention}", ephemeral=True)
+
+@bot.tree.command(name="timeout", description="Timeout a member")
+@commands.has_permissions(moderate_members=True)
+async def timeout(interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str = "No reason provided"):
+    await member.timeout(timedelta(minutes=minutes), reason=reason)
+    embed = discord.Embed(title="Member Timed Out", description=f"{member.mention} was timed out for {minutes} minutes by {interaction.user.mention}", color=discord.Color.yellow())
+    await log_event(interaction.guild, embed)
+    await interaction.response.send_message(f"Timed out {member.mention}", ephemeral=True)
+
+@bot.tree.command(name="invites", description="Check invite count")
+async def invites(interaction: discord.Interaction, user: discord.Member = None):
+    user = user or interaction.user
+    cursor.execute("SELECT invite_count FROM invites WHERE guild_id = ? AND user_id = ?", (interaction.guild.id, user.id))
+    row = cursor.fetchone()
+    count = row[0] if row else 0
+    await interaction.response.send_message(f"{user.mention} has invited **{count}** people.", ephemeral=True)
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
-
-    # Only respond in ticket channels
-    if not message.channel.name.startswith("ticket-"):
-        await bot.process_commands(message)
-        return
-
-    # Ignore if it's a staff-only message or commands
-    if message.content.startswith("!") or message.content.startswith("/"):
-        await bot.process_commands(message)
-        return
-
-    # Build conversation history (last 10 messages)
-    history = []
-    async for msg in message.channel.history(limit=12, oldest_first=False):
-        if msg.author.bot and msg.author != bot.user:
-            continue
-        role = "assistant" if msg.author == bot.user else "user"
-        content = msg.content
-        if content:
-            history.append({"role": role, "content": f"{msg.author.display_name}: {content}"})
-
-    history.reverse()  # Chronological order
-
-    system_prompt = {
-        "role": "system",
-        "content": (
-            "You are a helpful, friendly, and professional Discord support assistant powered by Grok. "
-            "Answer questions clearly and concisely. Be polite and family-friendly. "
-            "If the issue is complex or requires human action (bans, refunds, account changes, etc.), "
-            "politely tell the user a staff member will assist them soon. "
-            "Do not make up information. Keep responses under 1500 characters when possible."
-        )
-    }
-
-    ai_messages = [system_prompt] + history[-10:]  # Last 10 turns
-
-    async with message.channel.typing():
-        reply = await get_ai_response(ai_messages)
-        # Split long messages if needed
-        if len(reply) > 1900:
-            chunks = [reply[i:i+1900] for i in range(0, len(reply), 1900)]
-            for chunk in chunks:
-                await message.channel.send(chunk)
-        else:
-            await message.channel.send(reply)
-
+    if any(word in message.content.lower() for word in ["badword1", "badword2"]):
+        try:
+            await message.delete()
+            embed = discord.Embed(title="Automod Action", description=f"Deleted message from {message.author.mention} for rule break", color=discord.Color.red())
+            await log_event(message.guild, embed)
+        except:
+            pass
     await bot.process_commands(message)
-
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
