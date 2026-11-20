@@ -181,7 +181,7 @@ class TicketClose(discord.ui.View):
 
 class BlackjackView(discord.ui.View):
     def __init__(self, player, amount, guild_id):
-        super().__init__(timeout=60)
+        super().__init__(timeout=120)
         self.player = player
         self.amount = amount
         self.guild_id = guild_id
@@ -201,13 +201,15 @@ class BlackjackView(discord.ui.View):
         return t
 
     def card_str(self, cards, hide_second=False):
-        symbols = {11: "A", 10: "10"}
+        suits = ["♠️", "♥️", "♦️", "♣️"]
         display = []
         for i, c in enumerate(cards):
             if hide_second and i == 1:
                 display.append("🂠")
             else:
-                display.append(symbols.get(c, str(c)))
+                rank = {11: "A", 10: "10"}.get(c, str(c))
+                suit = random.choice(suits)
+                display.append(f"{rank}{suit}")
         return " ".join(display)
 
     async def update_embed(self, interaction, ended=False):
@@ -223,12 +225,16 @@ class BlackjackView(discord.ui.View):
         if ended:
             for item in self.children:
                 item.disabled = True
-        await interaction.edit_original_response(embed=embed, view=self)
+        try:
+            await interaction.edit_original_response(embed=embed, view=self)
+        except:
+            pass
 
     @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
     async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.player or self.done:
-            return await interaction.response.defer()
+            return await interaction.response.send_message("This isn't your game or it's already finished.", ephemeral=True)
+        await interaction.response.defer()
         self.player_cards.append(self.draw())
         if self.total(self.player_cards) > 21:
             self.done = True
@@ -241,7 +247,8 @@ class BlackjackView(discord.ui.View):
     @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
     async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.player or self.done:
-            return await interaction.response.defer()
+            return await interaction.response.send_message("This isn't your game or it's already finished.", ephemeral=True)
+        await interaction.response.defer()
         self.done = True
         while self.total(self.dealer_cards) < 17:
             self.dealer_cards.append(self.draw())
@@ -260,7 +267,7 @@ class BlackjackView(discord.ui.View):
 
 class RouletteView(discord.ui.View):
     def __init__(self, player, amount, guild_id):
-        super().__init__(timeout=30)
+        super().__init__(timeout=60)
         self.player = player
         self.amount = amount
         self.guild_id = guild_id
@@ -297,25 +304,25 @@ class RouletteView(discord.ui.View):
     @discord.ui.button(label="Red", style=discord.ButtonStyle.danger)
     async def red(self, interaction, button):
         if interaction.user != self.player:
-            return await interaction.response.defer()
+            return await interaction.response.send_message("Not your game.", ephemeral=True)
         await self.spin(interaction, "color", "red")
 
     @discord.ui.button(label="Black", style=discord.ButtonStyle.secondary)
     async def black(self, interaction, button):
         if interaction.user != self.player:
-            return await interaction.response.defer()
+            return await interaction.response.send_message("Not your game.", ephemeral=True)
         await self.spin(interaction, "color", "black")
 
     @discord.ui.button(label="Even", style=discord.ButtonStyle.primary)
     async def even(self, interaction, button):
         if interaction.user != self.player:
-            return await interaction.response.defer()
+            return await interaction.response.send_message("Not your game.", ephemeral=True)
         await self.spin(interaction, "even")
 
     @discord.ui.button(label="Odd", style=discord.ButtonStyle.primary)
     async def odd(self, interaction, button):
         if interaction.user != self.player:
-            return await interaction.response.defer()
+            return await interaction.response.send_message("Not your game.", ephemeral=True)
         await self.spin(interaction, "odd")
 
 @bot.event
