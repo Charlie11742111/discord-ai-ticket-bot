@@ -331,6 +331,68 @@ async def inviteleaderboard(interaction: discord.Interaction, limit: int = 10):
     embed.description = description
     await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="clonecategory", description="Clone a category and its channels (with roles/permissions) to another server")
+@commands.has_permissions(administrator=True)
+async def clonecategory(interaction: discord.Interaction, source_category: discord.CategoryChannel, target_guild_id: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        target_guild = bot.get_guild(int(target_guild_id))
+        if not target_guild:
+            return await interaction.followup.send("Bot is not in the target server or invalid guild ID.", ephemeral=True)
+
+        # Create the category in the target server
+        new_category = await target_guild.create_category(name=source_category.name)
+
+        role_map = {}  # Map old role IDs to new roles
+
+        # Clone channels under the category
+        for channel in source_category.channels:
+            # Build overwrites, creating roles if needed
+            overwrites = {}
+            for target, overwrite in channel.overwrites.items():
+                if isinstance(target, discord.Role):
+                    # Find or create matching role in target guild
+                    if target.id not in role_map:
+                        existing = discord.utils.get(target_guild.roles, name=target.name)
+                        if existing:
+                            role_map[target.id] = existing
+                        else:
+                            # Create the role
+                            new_role = await target_guild.create_role(
+                                name=target.name,
+                                permissions=target.permissions,
+                                colour=target.colour,
+                                hoist=target.hoist,
+                                mentionable=target.mentionable
+                            )
+                            role_map[target.id] = new_role
+                    overwrites[role_map[target.id]] = overwrite
+                elif isinstance(target, discord.Member):
+                    # Skip member-specific overwrites for simplicity
+                    continue
+                else:
+                    overwrites[target] = overwrite
+
+            if isinstance(channel, discord.TextChannel):
+                await new_category.create_text_channel(
+                    name=channel.name,
+                    topic=channel.topic,
+                    overwrites=overwrites,
+                    nsfw=channel.nsfw,
+                    slowmode_delay=channel.slowmode_delay
+                )
+            elif isinstance(channel, discord.VoiceChannel):
+                await new_category.create_voice_channel(
+                    name=channel.name,
+                    overwrites=overwrites,
+                    bitrate=channel.bitrate,
+                    user_limit=channel.user_limit
+                )
+
+        await interaction.followup.send(f"Successfully cloned category **{source_category.name}** to {target_guild.name}!", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Error while cloning: {e}", ephemeral=True)
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
