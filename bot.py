@@ -307,6 +307,30 @@ async def invites(interaction: discord.Interaction, user: discord.Member = None)
     count = row[0] if row else 0
     await interaction.response.send_message(f"{user.mention} has invited **{count}** people.", ephemeral=True)
 
+@bot.tree.command(name="inviteleaderboard", description="Show the top inviters in the server")
+async def inviteleaderboard(interaction: discord.Interaction, limit: int = 10):
+    if limit > 25:
+        limit = 25
+    if limit < 1:
+        limit = 10
+    cursor.execute("""
+        SELECT user_id, invite_count FROM invites
+        WHERE guild_id = ? AND invite_count > 0
+        ORDER BY invite_count DESC
+        LIMIT ?
+    """, (interaction.guild.id, limit))
+    rows = cursor.fetchall()
+    if not rows:
+        return await interaction.response.send_message("No invite data yet.", ephemeral=True)
+    embed = discord.Embed(title=f"Top {limit} Inviters", color=discord.Color.gold())
+    description = ""
+    for i, (user_id, count) in enumerate(rows, 1):
+        member = interaction.guild.get_member(user_id)
+        name = member.display_name if member else f"User {user_id}"
+        description += f"**{i}.** {name} — **{count}** invites\n"
+    embed.description = description
+    await interaction.response.send_message(embed=embed)
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
